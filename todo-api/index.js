@@ -3,7 +3,7 @@ const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const redis = require('redis');
 var elasticsearch = require('elasticsearch');
-const envProps = require('./local_env_props');
+const envProps = require('./env_props');
 
 // Initializing the Express Framework /////////////////////////////////////////////////////
 const app = express();
@@ -37,13 +37,22 @@ const redisClient = redis.createClient({
     enable_offline_queue: false,
     retry_strategy: () => 1000 // try reconnecting after 1 sec.
 });
-redisClient.on('connect', () => console.log('Redis client connected'));
-redisClient.on('error', (err) => console.log('Something went wrong with Redis: ' + err));
+
+redisClient.on('connect', () => {
+    console.log('Redis client connected');
+});
+
+redisClient.on('error', (err) => {
+    console.log('Something went wrong with Redis: ' + err);
+});
+
+redisClient.connect().catch(console.error); // Ensure connection is established
 
 // Elasticsearch Client Setup ///////////////////////////////////////////////
 const elasticClient = new elasticsearch.Client({
-    hosts: [ envProps.elasticHost + ':' + envProps.elasticPort]
+    hosts: [envProps.elasticHost + ':' + envProps.elasticPort]
 });
+
 // Ping the client to be sure Elastic is up
 elasticClient.ping({
     requestTimeout: 30000,
@@ -54,52 +63,58 @@ elasticClient.ping({
         console.log('Elasticsearch client connected');
     }
 });
-// Create a Todos index. If the index has already been created, then this function fails safely
+
+// Create a Todos index if it doesn't already exist
 const TODO_SEARCH_INDEX_NAME = "todos";
 const TODO_SEARCH_INDEX_TYPE = "todo";
-elasticClient.indices.create({
-    index: TODO_SEARCH_INDEX_NAME
-}, function(error, response, status) {
-    if (error) {
-        console.log(error);
-    } else {
-        console.log("Created a new Elastic index: " + TODO_SEARCH_INDEX_NAME, response);
+
+async function createIndexIfNotExists() {
+    try {
+        const indexExists = await elasticClient.indices.exists({ index: TODO_SEARCH_INDEX_NAME });
+        if (!indexExists) {
+            await elasticClient.indices.create({ index: TODO_SEARCH_INDEX_NAME });
+            console.log(`Created a new Elastic index: ${TODO_SEARCH_INDEX_NAME}`);
+        } else {
+            console.log(`Index ${TODO_SEARCH_INDEX_NAME} already exists.`);
+        }
+    } catch (error) {
+        console.error('Error checking or creating index:', error);
     }
-});
+}
+
+createIndexIfNotExists();
 
 // Set up the API routes /////////////////////////////////////////////////////
-
 // Get all todos
-app.route('/api/v1/todos').get( async (req, res) => {
+app.route('/api/v1/todos').get(async (req, res) => {
     console.log('CALLED GET api/v1/todos');
 
     res.setHeader('Content-Type', 'application/json');
 
-    // First, try get todos from cache (get all members of Set)
-    await redisClient.smembers('todos', async (error, cachedTodoSet) => { //["Get kids from school","Take out the trash","Go shopping"]
-        if (error) {
-            console.log('  Redis get todos error: ' + error);
+    try {
+        if (!redisClient.isOpen) {
+            await redisClient.connect();  // Ensure the client is connected
         }
 
-        var todos = []; // [{"title":"Get kids from school"},{"title":"Take out the trash"},{"title":"Go shopping"}]
-        if (cachedTodoSet == null) {
+        // Fetch all members of the Redis set 'todos'
+        const cachedTodoSet = await redisClient.sMembers('todos'); 
+        let todos = [];
+
+        if (cachedTodoSet.length === 0) {
             // Nothing in cache, get from database
-            await postgresClient.query('SELECT title FROM todo', (error, todoRows) => {
-                if(error) {
-                    throw error;
-                }
-                todos = todoRows.rows; // [{"title":"Get kids from school"},{"title":"Take out the trash"},{"title":"Go shopping"}]
-                console.log('  Got todos from PostgreSQL db: ' + todos);
-                res.send(todos);
-            });
+            const result = await postgresClient.query('SELECT title FROM todo');
+            todos = result.rows; 
+            console.log('  Got todos from PostgreSQL db: ' + JSON.stringify(todos));
         } else {
-            for(var i = 0; i < cachedTodoSet.length; i++) {
-                todos.push({"title": cachedTodoSet[i]});
-            }
-            console.log('  Got todos from Redis cache: ' + todos);
-            res.send(todos);
+            todos = cachedTodoSet.map(title => ({ title }));
+            console.log('  Got todos from Redis cache: ' + JSON.stringify(todos));
         }
-    });
+
+        res.send(todos);
+    } catch (error) {
+        console.error('Error fetching todos: ', error);
+        res.status(500).send('Internal Server Error');
+    }
 });
 
 // Create a new todo
@@ -117,12 +132,13 @@ app.route('/api/v1/todos').post( async (req, res) => {
     });
 
     // Update the Redis cache (add the todo text to the Set in Redis)
-    await redisClient.sadd(['todos', todoTitle], (error, reply) => {
-        if (error) {
-            throw error;
-        }
+    try {
+        const reply = await redisClient.sAdd('todos', todoTitle);
         console.log('  Added Todo: [' + todoTitle + '] to Cache');
-    });
+    } catch (error) {
+        console.error('Error adding Todo to Redis:', error);
+        throw error;
+    }
 
     // Update the search index
     await elasticClient.index({
